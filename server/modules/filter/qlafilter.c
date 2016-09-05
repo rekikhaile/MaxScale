@@ -104,6 +104,7 @@ typedef struct
     regex_t re; /* Compiled regex text */
     char *nomatch; /* Optional text to match against for exclusion */
     regex_t nore; /* Compiled regex nomatch text */
+    int singleFile; /*rekik boolean to determine logging mode(whether to log everything in a single file)*/
 } QLA_INSTANCE;
 
 /**
@@ -122,6 +123,7 @@ typedef struct
     int active;
     char *user;
     char *remote;
+    int sessionID; /*rekik track the client's session ID for logging in a single file*/
 } QLA_SESSION;
 
 /**
@@ -183,6 +185,7 @@ createInstance(char **options, FILTER_PARAMETER **params)
         my_instance->match = NULL;
         my_instance->nomatch = NULL;
         my_instance->filebase = NULL;
+        my_instance->singleFile = 1;
         bool error = false;
 
         if (params)
@@ -341,16 +344,39 @@ newSession(FILTER *instance, SESSION *session)
         my_session->user = userName;
         my_session->remote = remote;
 
-        sprintf(my_session->filename, "%s.%d",
-                my_instance->filebase,
-                my_instance->sessions);
+        my_session->sessionID = my_instance->sessions; /*rekik saving client's session ID to distinguish clients
+                                                            when logging into a single file*/
+
+
+        /*rekik check logging mode and set filename accordingly.
+          If logging into a single file, set the filename to
+          my_instance->filebase. If logging into multiple files,
+          append client session ID to the filename*/
+        if (my_instance->singleFile)
+        {
+            strcpy(my_session->filename, my_instance->filebase);
+        }
+        else
+        {
+            sprintf(my_session->filename, "%s.%d",
+                    my_instance->filebase,
+                    my_instance->sessions);
+        }
 
         // Multiple sessions can try to update my_instance->sessions simultaneously
         atomic_add(&(my_instance->sessions), 1);
 
         if (my_session->active)
         {
-            my_session->fp = fopen(my_session->filename, "w");
+            /*rekik append in order to write in one file to log it into a single file*/
+            if (my_instance->singleFile)
+            {
+                my_session->fp = fopen(my_session->filename, "a");
+            }
+            else
+            {
+                my_session->fp = fopen(my_session->filename, "w");
+            }
 
             if (my_session->fp == NULL)
             {
@@ -385,6 +411,7 @@ newSession(FILTER *instance, SESSION *session)
  * @param session   The session being closed
  */
 static void
+
 closeSession(FILTER *instance, void *session)
 {
     QLA_SESSION *my_session = (QLA_SESSION *) session;
@@ -464,8 +491,19 @@ routeQuery(FILTER *instance, void *session, GWBUF *queue)
                 gettimeofday(&tv, NULL);
                 localtime_r(&tv.tv_sec, &t);
                 strftime(buffer, sizeof(buffer), "%F %T", &t);
-                fprintf(my_session->fp, "%s,%s@%s,%s\n", buffer, my_session->user,
-                        my_session->remote, trim(squeeze_whitespace(ptr)));
+
+                /*rekik writing to the file; add session ID to differentiate between
+                 different client sessions if logging to a single file*/
+                if (my_instance->singleFile)
+                {
+                    fprintf(my_session->fp, "%s,%s@%s,%s,%d\n", buffer, my_session->user,
+                            my_session->remote, trim(squeeze_whitespace(ptr)), my_session->sessionID);
+                }
+                else
+                {
+                    fprintf(my_session->fp, "%s,%s@%s,%s\n", buffer, my_session->user,
+                            my_session->remote, trim(squeeze_whitespace(ptr)));
+                }
             }
             free(ptr);
         }
