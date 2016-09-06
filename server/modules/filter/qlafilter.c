@@ -47,6 +47,7 @@
 #include <regex.h>
 #include <string.h>
 #include <atomic.h>
+#include <query_classifier.h>
 
 MODULE_INFO info =
 {
@@ -104,8 +105,12 @@ typedef struct
     regex_t re; /* Compiled regex text */
     char *nomatch; /* Optional text to match against for exclusion */
     regex_t nore; /* Compiled regex nomatch text */
-    int singleFile; /*rekik boolean to determine logging mode(whether to log everything in a single file)*/
+    int loggingMode; /*rekik variable used to determine logging mode*/
 } QLA_INSTANCE;
+
+static const int LOGGING_MODE_PER_SESSION = 0;
+static const int LOGGING_MODE_SINGLE_FILE = 1;
+static const int LOGGING_MODE_PER_DATABASE = 2;
 
 /**
  * The session structure for this QLA filter.
@@ -124,6 +129,7 @@ typedef struct
     char *user;
     char *remote;
     int sessionID; /*rekik track the client's session ID for logging in a single file*/
+    int databaseNameFollows; /*rekik flags that the next statement will contain the name of the database being switched to*/
 } QLA_SESSION;
 
 /**
@@ -185,7 +191,7 @@ createInstance(char **options, FILTER_PARAMETER **params)
         my_instance->match = NULL;
         my_instance->nomatch = NULL;
         my_instance->filebase = NULL;
-        my_instance->singleFile = 1;
+        my_instance->loggingMode = LOGGING_MODE_PER_DATABASE; //rekik set logging mode
         bool error = false;
 
         if (params)
@@ -347,20 +353,26 @@ newSession(FILTER *instance, SESSION *session)
         my_session->sessionID = my_instance->sessions; /*rekik saving client's session ID to distinguish clients
                                                             when logging into a single file*/
 
+        my_session->databaseNameFollows = 0; /*rekik initialize flag to false*/
+
 
         /*rekik check logging mode and set filename accordingly.
           If logging into a single file, set the filename to
           my_instance->filebase. If logging into multiple files,
           append client session ID to the filename*/
-        if (my_instance->singleFile)
+        if (my_instance->loggingMode == LOGGING_MODE_SINGLE_FILE)
         {
             strcpy(my_session->filename, my_instance->filebase);
         }
-        else
+        else if (my_instance->loggingMode == LOGGING_MODE_PER_SESSION)
         {
             sprintf(my_session->filename, "%s.%d",
                     my_instance->filebase,
                     my_instance->sessions);
+        }
+        else if (my_instance->loggingMode == LOGGING_MODE_PER_DATABASE)
+        {
+        	// rekik when logging per database we can only decide which file to open when we see the query
         }
 
         // Multiple sessions can try to update my_instance->sessions simultaneously
@@ -369,16 +381,24 @@ newSession(FILTER *instance, SESSION *session)
         if (my_session->active)
         {
             /*rekik append in order to write in one file to log it into a single file*/
-            if (my_instance->singleFile)
+            if (my_instance->loggingMode == LOGGING_MODE_SINGLE_FILE)
             {
                 my_session->fp = fopen(my_session->filename, "a");
             }
-            else
+            else if (my_instance->loggingMode == LOGGING_MODE_PER_SESSION)
             {
                 my_session->fp = fopen(my_session->filename, "w");
             }
+            else if (my_instance->loggingMode == LOGGING_MODE_PER_DATABASE)
+            {
+            	/*rekik when logging per database we can only decide
+            	which file to open when we see the query*/
+            }
 
-            if (my_session->fp == NULL)
+            /*rekik added check for per-database mode since then we don't
+             * open a file yet since we haven't seen queries to get the
+             * name of the database yet*/
+            if (my_session->fp == NULL && my_instance->loggingMode != LOGGING_MODE_PER_DATABASE)
             {
                 char errbuf[STRERROR_BUFLEN];
                 MXS_ERROR("Opening output file for qla "
@@ -492,17 +512,52 @@ routeQuery(FILTER *instance, void *session, GWBUF *queue)
                 localtime_r(&tv.tv_sec, &t);
                 strftime(buffer, sizeof(buffer), "%F %T", &t);
 
-                /*rekik writing to the file; add session ID to differentiate between
-                 different client sessions if logging to a single file*/
-                if (my_instance->singleFile)
+                /*rekik writing to the file in a mode dependent way*/
+                if (my_instance->loggingMode == LOGGING_MODE_SINGLE_FILE)
                 {
-                    fprintf(my_session->fp, "%s,%s@%s,%s,%d\n", buffer, my_session->user,
-                            my_session->remote, trim(squeeze_whitespace(ptr)), my_session->sessionID);
+                	/*rekik add session ID to differentiate between
+                 	 different client sessions if logging to a single file*/
+
+                		fprintf(my_session->fp, "%s,%s@%s,%s,%d\n", buffer, my_session->user,
+                		                				my_session->remote, trim(squeeze_whitespace(ptr)), my_session->sessionID);
                 }
-                else
+                else if (my_instance->loggingMode == LOGGING_MODE_PER_SESSION)
                 {
                     fprintf(my_session->fp, "%s,%s@%s,%s\n", buffer, my_session->user,
                             my_session->remote, trim(squeeze_whitespace(ptr)));
+                }
+                else if (my_instance->loggingMode == LOGGING_MODE_PER_DATABASE)
+                {
+                	/*rekik if the last query seen was "SELECT DATABASE()" we expect the
+                	 * database name now */
+					if (my_session->databaseNameFollows == 1)
+					{
+						if (my_session->fp != NULL)
+						{
+							fclose(my_session->fp);
+						}
+
+						sprintf(my_session->filename, "%s.%s",
+								my_instance->filebase,
+								trim(squeeze_whitespace(ptr)));
+
+						my_session->fp = fopen(my_session->filename, "a");
+
+						my_session->databaseNameFollows = 0;
+					}
+
+					/*rekik look database change operation*/
+					if (strcmp(trim(squeeze_whitespace(ptr)), "SELECT DATABASE()") == 0)
+					{
+						my_session->databaseNameFollows = 1;
+					}
+
+					/*rekik if we have a file open we can write to it*/
+					if (my_session->fp != NULL)
+					{
+						fprintf(my_session->fp, "%s,%s@%s,%s,%d\n", buffer, my_session->user,
+						        my_session->remote, trim(squeeze_whitespace(ptr)), my_session->sessionID);
+					}
                 }
             }
             free(ptr);
